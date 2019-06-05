@@ -1,0 +1,14 @@
+# data
+data/*
+*.tar.gz
+
+# notes
+fe_hyperparameter.py
+
+# bert-related directories
+# https://github.com/google-research/bert
+bert/*
+# biobert pre-trained model, https://github.com/naver/biobert-pretrained/releases
+biobert_v1.1_pubmed/*
+# keras_bert directory from https://github.com/CyberZHG/keras-bert/tree/master/keras_bert
+keras_bert/*
