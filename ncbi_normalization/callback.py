@@ -14,8 +14,8 @@ from keras.models import load_model
 from datetime import datetime
 import io
 
-import model_tools
-from cnn import semantic_similarity_layer
+from ncbi_normalization import model_tools
+from ncbi_normalization.cnn import semantic_similarity_layer
 
 def save_model(model, path,now):
 	logger.info('Saving best model to {0}'.format(path+now))
@@ -23,7 +23,7 @@ def save_model(model, path,now):
 	weights_name = path + now + '.h5'
 	model_tools.save_model(model, model_name, weights_name)
 
-def evaluate(data_mentions, predictions, data_y):
+def evaluate(data_mentions, predictions, data_y, write=False):
 	'''
 	Input:
 	data_mentions: e.g. val_data.mentions, of the form [(start,end,untok_mention),(),...,()]
@@ -32,15 +32,28 @@ def evaluate(data_mentions, predictions, data_y):
 	'''
 	assert len(predictions) == len(data_y)
 	correct = 0
-	logger.warning('High chance of same prediction scores.')
-	for start, end, untok_mention in data_mentions:
-		index_prediction = np.argmax(predictions[start:end],axis=0)
-		# print(index_prediction) # prediction same for first few epochs
-		if data_y[start:end][index_prediction] == 1:
-			correct += 1
+	if write:
+		f = open(history,"a",encoding='utf-8')
+		for start, end, untok_mention in data_mentions:
+			index_prediction = np.argmax(predictions[start:end],axis=0)
+			if data_y[start:end][index_prediction] == 1:
+				correct += 1
+				f.write('Correct - Gold: {0}, Prediction: {1}\n'.format(untok_mention,concept.names[index_prediction.tolist()[0]]))
+			else:
+				f.write('Incorrect - Gold: {0}, Prediction: {1}\n'.format(untok_mention,concept.names[index_prediction.tolist()[0]]))
+	else:
+		for start, end, untok_mention in data_mentions:
+			index_prediction = np.argmax(predictions[start:end],axis=0)
+			# print(index_prediction) # prediction same for first few epochs
+			if data_y[start:end][index_prediction] == 1:
+				correct += 1
 	total = len(data_mentions)
 	accuracy = correct/total
-	logger.info('Accuracy: {0}, Correct: {1}, Total: {2}'.format(accuracy,correct,total))
+	if write:
+		f.write('Accuracy: {0}, Correct: {1}, Total: {2}'.format(accuracy,correct,total))
+		f.close()
+	else:
+		logger.info('Accuracy: {0}, Correct: {1}, Total: {2}'.format(accuracy,correct,total))
 	return accuracy
 
 def write_training_info(conf,path):

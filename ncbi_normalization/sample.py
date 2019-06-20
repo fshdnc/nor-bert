@@ -47,6 +47,7 @@ class NewDataSet:
         self.tokenize = None
         self.padded = None
         self.elmo = None
+        self.biobert = None
 
         self.vectorize = None # numpy array
         self.all = None # dict

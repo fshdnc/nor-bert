@@ -1,4 +1,12 @@
-import pickle, sys
+'''
+no context
+'''
+
+import pickle, sys, os, random, time
+random.seed(1)
+import logging
+import logging.config
+import configparser as cp
 from tqdm import tqdm
 import tensorflow as tf
 import numpy as np
@@ -11,6 +19,7 @@ from keras.backend.tensorflow_backend import set_session
 from keras.layers import Dense, Flatten, Lambda
 from keras.models import Model
 from keras.optimizers import Adam, SGD
+from keras.preprocessing.sequence import pad_sequences
 
 from keras_bert.loader import load_trained_model_from_checkpoint
 from keras_bert.bert import *
@@ -21,20 +30,29 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import precision_recall_fscore_support
 
-from ncbi_normalization import vectorizer
 from ncbi_normalization import load
-from ncbi_normalization import sample
+from ncbi_normalization.parse_MEDIC_dictionary import concept_obj
+from ncbi_normalization import vectorizer, sample, callback
 
+#configurations
+TIME = time.strftime('%Y%m%d-%H%M%S')
+dynamic_defaults = {'timestamp': TIME}
+config = cp.ConfigParser(defaults=dynamic_defaults,interpolation=cp.ExtendedInterpolation(),strict=False)
+try:
+    directory = os.path.join(os.path.abspath(os.path.dirname(__file__)))
+    config.read(os.path.join(directory, 'src/defaults.cfg'))
+except NameError:
+    directory = '/home/lhchan/nor-bert/src'
+    config.read(os.path.join(directory, 'defaults.cfg'))
 
-config = tf.ConfigProto()
-config.gpu_options.allow_growth = True
-set_session(tf.Session(config=config))
+gpu_config = tf.ConfigProto()
+gpu_config.gpu_options.allow_growth = True
+set_session(tf.Session(config=gpu_config))
 
-# set parameters:
-batch_size = 10
-max_batch_size = 10
-epochs = 10
-maxlen = 384
+#logging
+logger = logging.getLogger(__name__)
+from src.settings import LOGGING_SETTINGS
+logging.config.dictConfig(LOGGING_SETTINGS)
 
 
 def dump_data(file_name, data):
@@ -47,71 +65,201 @@ def load_data(file_name):
     with open(file_name, "rb") as f:
         return pickle.load(f)
 
-def load_concepts():
+def load_concepts(dict_file):
+    '''
+    dict_file: directory to the tsv file of MEDIC dictionary
+    dictionary.loaded format:
+        dictionary of entries, key = canonical id, value = named tuple in the form of
+        MEDIC_ENTRY(DiseaseID='MESH:D005671', DiseaseName='Fused Teeth',
+        AllDiseaseIDs=('MESH:D005671',), AllNames=('Fused Teeth', 'Teeth, Fused')
+    '''
     # MEDIC dictionary
     dictionary = load.Terminology()
-    # dictionary of entries, key = canonical id, value = named tuple in the form of
-    #   MEDIC_ENTRY(DiseaseID='MESH:D005671', DiseaseName='Fused Teeth',
-    #   AllDiseaseIDs=('MESH:D005671',), AllNames=('Fused Teeth', 'Teeth, Fused')
-    dictionary.loaded = load.load('data/CTD_diseases.tsv','MEDIC')
+    dictionary.loaded = load.load(dict_file,'MEDIC')
 
-    from ncbi_normalization.parse_MEDIC_dictionary import concept_obj
-    print('Using truncated development corpus for evaluation.')
-    #logger.info('Using truncated development corpus for evaluation.')
-    [real_val_data,concept_order,corpus_dev] = pickle.load(open('data/gitig_real_val_data_truncated_d50_p5.pickle','rb'))
-    real_val_data.y=np.array(real_val_data.y)
+    logger.info('Using sampled development corpus for evaluation.')
+    smpl_dev_data = sample.Data()
+    corpus_dev_sampled = sample.NewDataSet('dev corpus')
+    [smpl_dev_data.mentions,smpl_dev_data.y,concept_order,corpus_dev_sampled.ids,corpus_dev_sampled.info,corpus_dev_sampled.names] = load_data('data/sampled_dev_set.pickle')
+    smpl_dev_data.y=np.array(smpl_dev_data.y)
     concept = concept_obj(dictionary,order=concept_order)
+    concept.names = [name.lower() for name in concept.names]
 
-    return concept, real_val_data
-
-def load_mentions():
-    pass
-
-def tokenize(abstracts, maxlen=512):
-    tokenizer = tokenization.FullTokenizer("biobert_v1.1_pubmed/vocab.txt", do_lower_case=False)
-    
-
-    ret_val = []
-    for abstract in tqdm(abstracts, desc="Tokenizing abstracts"):
-        abstract = ["[CLS]"] + tokenizer.tokenize(abstract[0:maxlen-2]) + ["[SEP]"]
-        ret_val.append(abstract)
-    return ret_val, tokenizer.vocab
+    return concept, smpl_dev_data, dictionary, corpus_dev_sampled
 
 
-def transform(abstracts_file, mesh_file):
+def load_mentions(corpus_file,corpus_type):
+    '''
+    corpus_file: file to the ncbi set
+    corpus_type: 'training corpus' or 'dev corpus' or 'test corpus'
+    '''
+    corpus = sample.NewDataSet(corpus_type)
+    corpus.objects = load.load(corpus_file,'NCBI')
 
-    print("Reading input files..")
+    corpus.ids = [] # list of all ids (gold standard for each mention)
+    corpus.names = [] # list of all names
+    corpus.all = [] # list of tuples (mention_text,gold,context,(start,end,docid))
 
-    abstracts = load_data("./" + abstracts_file)
-    labels = load_data("./" + mesh_file)
+    for abstract in corpus.objects:
+        for section in abstract.sections: # title and abstract
+            for mention in section.mentions:
+                nor_ids = [sample._nor_id(one_id) for one_id in mention.id]
+                corpus.ids.append(nor_ids) # append list of ids, usually len(list)=1
+                corpus.names.append(mention.text)
+                corpus.all.append((mention.text,nor_ids,section.text,(mention.start,mention.end,abstract.docid)))
+    corpus.names = [name.lower() for name in corpus.names]
 
-    abstracts, vocab = tokenize(abstracts, maxlen=maxlen)
-
-    print("Vectorizing..")
-    token_vectors = np.asarray( [np.asarray( [vocab[token] for token in abstract] + [0] * (maxlen - len(abstract)) ) for abstract in abstracts] )
-    del abstracts
-    print("Token_vectors shape:", token_vectors.shape)
-
-    print("Binarizing labels..")
-    one_hot_encoder = OneHotEncoder(sparse=False, categories='auto')
-    labels = one_hot_encoder.fit_transform(np.asarray(labels).reshape(-1,1))
-    labels = labels.astype('b')
-    print("Labels shape:", labels.shape)
-    #print(np.dtype(labels))
-
-    print("Splitting..")
-    token_vectors_train, token_vectors_test, labels_train, labels_test = train_test_split(token_vectors, labels, test_size=0.1)
-
-    _, sequence_len = token_vectors_train.shape
-
-    return token_vectors_train, token_vectors_test, labels_train, labels_test, sequence_len
+    return corpus
 
 
-def build_model(abstracts_train, abstracts_test, labels_train, labels_test, sequence_len):
+def transform(tokenizer,mention,concepts,mmaxlen,cmaxlen):
+    '''
+    Takes in one mention, 1 pos and n neg concepts
+    '''
+    mention = tokenizer.tokenize(mention)[:mmaxlen]
+    # NO LOWERCASE
+    instances = [["[CLS]"] + mention + ["[SEP]"] + tokenizer.tokenize(concept)[:cmaxlen] + ["[SEP]"] for concept in concepts]
+    segmentation = [[0]*(len(mention)+2)+[1]*(len(concept)+1) for concept in concepts]
+    instances = np.asarray([np.asarray([tokenizer.vocab[token] for token in instance] + [0] * (mmaxlen + cmaxlen + 3 - len(instance)) ) for instance in instances])
+    segmentation = pad_sequences(np.array(segmentation),padding='post',maxlen=mmaxlen+cmaxlen+3)
+    # sanity check
+    _, sequence_len = instances.shape
+    assert sequence_len == mmaxlen + cmaxlen + 3
 
-    checkpoint_file = "../../biobert_pubmed/biobert_model.ckpt"
-    config_file = "../../biobert_pubmed/bert_config.json"
+    return instances, segmentation
 
+
+def examples(concept, positives, tokenizer, neg_count, mmaxlen, cmaxlen):
+    """
+    Builds positive and negative examples.
+    """
+    while True:
+        for (chosen_idx, idces), m_span in positives:          
+            if len(chosen_idx) ==1:
+                # FIXME: only taking into account whose gold standard has exactly one concept
+                c_span = [concept.names[chosen_idx[0]]]
+                negative_spans = [concept.names[i] for i in random.sample(list(set([*range(len(concept.names))])-set(idces)),neg_count)]
+
+                inputs, segmentation = transform(tokenizer,m_span,c_span+negative_spans,mmaxlen,cmaxlen)
+                distances = [1] + [0]*neg_count
+                data = {
+                    'Input-Token': inputs,
+                    'Input-Segment': segmentation,
+                    'prediction_layer': np.asarray(distances),
+                }
+                yield data, data
+
+
+def transform_concepts(concept, tokenizer, cmaxlen):
+    '''
+    Takes in concept object
+    '''
+    concept = [tokenizer.tokenize(span)[:cmaxlen] for span in concept.names]
+    return concept
+
+def examples_prediction(vectorized_concepts, positives, mmaxlen, cmaxlen):
+    while True:
+        for (chosen_idx, idces), m_span in positives:
+            # FIXME: one for loop takes forever
+            mention = tokenizer.tokenize(m_span)[:mmaxlen]
+            instances = [["[CLS]"] + mention + ["[SEP]"] + concept + ["[SEP]"] for concept in vectorized_concepts]
+            instances = np.asarray([np.asarray([tokenizer.vocab[token] for token in instance] + [0] * (mmaxlen + cmaxlen + 3 - len(instance)) ) for instance in instances])
+
+            segmentation = [[0]*(len(mention)+2)+[1]*(len(concept)+1) for concept in vectorized_concepts]
+            segmentation = pad_sequences(np.array(segmentation),padding='post',maxlen=mmaxlen+cmaxlen+3)
+
+            distances = [0] # dummy
+            data = {
+                'Input-Token': instances,
+                'Input-Segment': segmentation,
+                'prediction_layer': np.asarray(distances),
+            }
+
+            yield data, data
+
+
+from datetime import datetime
+from keras.callbacks import Callback
+
+class EarlyStoppingRankingAccuracyGenerator(Callback):
+    '''
+    Ranking accuracy callback with early stopping.
+    '''
+    def __init__(self, conf, original_model,val_generator,val_data):
+        super().__init__()
+        self.conf = conf
+        self.original_model = original_model
+        self.val_generator = val_generator
+        self.val_data = val_data
+
+        self.best = 0 # best accuracy
+        self.wait = 0
+        self.stopped_epoch = 0
+        self.patience = int(conf['training']['patience'])
+        self.model_path = conf['model']['path_model_whole']
+
+        #self.save = int(self.conf['settings']['save_prediction'])
+        self.now = datetime.now().strftime('%Y%m%d-%H%M%S')
+        self.history = self.conf['settings']['history'] + self.now + '.txt'
+        callback.write_training_info(self.conf,self.history)
+
+    def on_train_begin(self, logs={}):
+        self.losses = []
+        self.accuracy = []
+
+        self.wait = 0
+        with open(self.history,'a',encoding='utf-8') as fh:
+        # Pass the file handle in as a lambda function to make it callable
+            self.original_model.summary(print_fn=lambda x: fh.write(x + '\n'))
+        return
+
+    def on_epoch_end(self, epoch, logs={}):
+        self.losses.append(logs.get('loss'))
+        predictions = self.original_model.predict_generator(self.val_generator,steps=len(self.val_data.y))
+        evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y)
+        self.accuracy.append(evaluation_parameter)
+
+        with open(self.history,'a',encoding='utf-8') as f:
+            f.write('Epoch: {0}, Training loss: {1}, validation accuracy: {2}\n'.format(epoch,logs.get('loss'),evaluation_parameter))
+            if logs.get('val_loss'):
+                f.write('Epoch: {0}, Validation loss: {1}\n'.format(epoch,logs.get('val_loss')))
+                
+        if evaluation_parameter > self.best:
+            logging.info('Intermediate model saved.')
+            self.best = evaluation_parameter
+            self.original_model.save(self.model_path)
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait > int(self.conf['training']['patience']):
+                self.stopped_epoch = epoch
+                self.original_model.stop_training = True
+        logger.info('Testing: epoch: {0}, self.original_model.stop_training: {1}'.format(epoch,self.original_model.stop_training))
+        return
+
+    def on_train_end(self, logs=None):
+        if self.stopped_epoch > 0:
+            logger.info('Epoch %05d: early stopping', self.stopped_epoch + 1)
+        try:
+            self.original_model.load_weights(self.model_path)
+            logger.info('Best model reloaded.')
+        except OSError:
+            pass
+        predictions = self.original_model.predict_generator(self.val_generator,steps=len(self.val_data.y))
+        evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y,write=True)
+        if not self.conf.getint('model','save'): # if don't want to save model, delete the cached model
+            try:
+                os.remove(self.model_path)
+            except FileNotFoundError:
+                pass
+        return
+
+    def on_batch_end(self, batch, logs={}):
+        self.losses.append(logs.get('loss'))
+        return
+
+
+def build_model(checkpoint_file,config_file,sequence_len,learning_rate):
     biobert = load_trained_model_from_checkpoint(config_file, checkpoint_file, training=False, seq_len=sequence_len)
     #biobert_train = load_trained_model_from_checkpoint(config_file, checkpoint_file, training=True, seq_len=sequence_len)
 
@@ -119,57 +267,57 @@ def build_model(abstracts_train, abstracts_test, labels_train, labels_test, sequ
     for layer in biobert.layers[:]:
         layer.trainable = True
 
-    print(biobert.input)
-    print(biobert.layers[-1].output)
+    logger.info(biobert.input)
+    logger.info(biobert.layers[-1].output)
 
-    print(tf.slice(biobert.layers[-1].output, [0, 0, 0], [-1, 1, -1]))
+    logger.info(tf.slice(biobert.layers[-1].output, [0, 0, 0], [-1, 1, -1]))
 
     slice_layer = Lambda(lambda x: tf.slice(x, [0, 0, 0], [-1, 1, -1]))(biobert.layers[-1].output)
 
     flatten_layer = Flatten()(slice_layer)
 
-    output_layer = Dense(labels_train.shape[1], activation='softmax')(flatten_layer)
+    prediction_layer = Dense(1, activation='sigmoid',name='prediction_layer')(flatten_layer)
 
-    model = Model(biobert.input, output_layer)
+    model = Model(inputs=biobert.input, outputs=prediction_layer)
 
-    print(model.summary(line_length=118))
+    logger.info(model.summary(line_length=118))
 
-    learning_rate = 0.00005
-
-    model.compile(loss='categorical_crossentropy',
-                metrics=[keras_metrics.precision(), keras_metrics.recall()],
+    model.compile(loss='binary_crossentropy',
                 optimizer=Adam(lr=learning_rate))#SGD(lr=0.2, momentum=0.9))
 
-    best_f1 = 0.0
-    stale_epochs = 0
+    return model
 
-    for epoch in range(epochs):
-        print("Epoch", epoch + 1)
-        #learning_rate -= 0.0001
-        cur_batch_size = min(batch_size + int(0.125 * epoch * batch_size), max_batch_size)
-        print("batch size:", cur_batch_size)
-        # model.compile(loss='binary_crossentropy',
-        #         optimizer=Adam(lr=learning_rate))
-        print("learning rate:", K.eval(model.optimizer.lr))
-        model_hist = model.fit([abstracts_train, np.zeros_like(abstracts_train)], labels_train,
-            batch_size=cur_batch_size,
-            epochs=1,
-            validation_data=[[abstracts_test, np.zeros_like(abstracts_test)], labels_test])
 
-        precision = model_hist.history['val_precision'][0]
-        recall = model_hist.history['val_recall'][0]
-        f1 = (2.0 * precision * recall) / (precision + recall)
 
-        print("F1-score:", f1, "\n")
+if __name__ == "__main__":
 
-        if f1 > best_f1:
-            best_f1 = f1
-            stale_epochs = 0
-            print("Saving model..\n")
-            model.save(sys.argv[3])
-        else:
-            stale_epochs += 1
-            if stale_epochs >= 10:
-                break
+    # concepts
+    concept, smpl_dev_data, dictionary, corpus_dev_sampled = load_concepts(config['terminology']['dict_file'])
+    # mentions
+    corpus_train = load_mentions(config['corpus']['training_file'],'training corpus')
+    corpus_dev = load_mentions(config['corpus']['development_file'],'dev corpus')
 
-build_model(*transform(sys.argv[1], sys.argv[2]))
+    tokenizer = tokenization.FullTokenizer(config['bert']['vocab_file'], do_lower_case=False)
+
+    # FIXME: only using one concept name per mention
+    positives_training, positives_dev, positives_dev_sampled = load_data('data/gitig_positive_indices.pickle')
+    del positives_dev
+    positive_training = [(_, span.lower()) for _, span in positives_training]
+    positives_dev_sampled = [(_, span.lower()) for _, span in positives_dev_sampled]
+
+    # generators for training and validation instances
+train_examples = examples(concept,positives_training,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+dev_examples = examples(concept,positives_dev_sampled,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+concept.biobert = transform_concepts(concept, tokenizer, cmaxlen = config.getint('training','cmaxlen'))
+prediction_examples = examples_prediction(concept.biobert, positives_dev_sampled, config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+
+    # steps for fit_generator
+    train_steps = len([0 for (chosen_idx, idces), m_span in positives_training if len(chosen_idx) ==1]) * (1 + config.getint('training','neg_count'))
+    dev_steps = len(corpus_dev.names)
+    seq_len = config.getint('training','mmaxlen') + config.getint('training','cmaxlen') + 3
+
+    model = build_model(config['bert']['checkpoint_file'],config['bert']['config_file'],seq_len,config.getfloat('model','lr'))
+eval_function = EarlyStoppingRankingAccuracyGenerator(config, model, prediction_examples, corpus_dev_sampled)
+hist = model.fit_generator(train_examples, steps_per_epoch=train_steps,validation_data=dev_examples, validation_steps=dev_steps, epochs=config.getint('training','epochs'), callbacks=[eval_function])
+
+

@@ -2,6 +2,10 @@
 data/*
 *.tar.gz
 
+# output
+gitig/*
+log/*
+
 # notes
 fe_hyperparameter.py
 
@@ -12,3 +16,6 @@ bert/*
 biobert_v1.1_pubmed/*
 # keras_bert directory from https://github.com/CyberZHG/keras-bert/tree/master/keras_bert
 keras_bert/*
+
+# garbage
+*__pycache__

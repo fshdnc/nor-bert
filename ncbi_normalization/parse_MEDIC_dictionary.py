@@ -3,6 +3,9 @@
 
 from collections import namedtuple
 
+import logging
+logger = logging.getLogger(__name__)
+
 '''read in MEDIC terminology, terminology file from DNorm system
 a lot of files in DNorm-0.0.7/data not looked into
 
