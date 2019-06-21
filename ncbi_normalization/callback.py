@@ -23,7 +23,7 @@ def save_model(model, path,now):
 	weights_name = path + now + '.h5'
 	model_tools.save_model(model, model_name, weights_name)
 
-def evaluate(data_mentions, predictions, data_y, write=False):
+def evaluate(data_mentions, predictions, data_y, write=None, concept=None):
 	'''
 	Input:
 	data_mentions: e.g. val_data.mentions, of the form [(start,end,untok_mention),(),...,()]
@@ -33,7 +33,8 @@ def evaluate(data_mentions, predictions, data_y, write=False):
 	assert len(predictions) == len(data_y)
 	correct = 0
 	if write:
-		f = open(history,"a",encoding='utf-8')
+		assert concept!=None
+		f = open(write,"a",encoding='utf-8')
 		for start, end, untok_mention in data_mentions:
 			index_prediction = np.argmax(predictions[start:end],axis=0)
 			if data_y[start:end][index_prediction] == 1:

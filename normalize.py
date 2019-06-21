@@ -2,7 +2,7 @@
 no context
 '''
 
-import pickle, sys, os, random, time
+import pickle, sys, os, random, time, math
 random.seed(1)
 import logging
 import logging.config
@@ -157,9 +157,9 @@ def transform_concepts(concept, tokenizer, cmaxlen):
     concept = [tokenizer.tokenize(span)[:cmaxlen] for span in concept.names]
     return concept
 
-def examples_prediction(vectorized_concepts, positives, mmaxlen, cmaxlen):
+def examples_prediction(vectorized_concepts, positives, mmaxlen, cmaxlen, batch_size):
     while True:
-        for (chosen_idx, idces), m_span in positives:
+        for (chosen_idx, idces), m_span in tqdm(positives, ascii=True, desc='Predicting'):
             # FIXME: one for loop takes forever
             mention = tokenizer.tokenize(m_span)[:mmaxlen]
             instances = [["[CLS]"] + mention + ["[SEP]"] + concept + ["[SEP]"] for concept in vectorized_concepts]
@@ -169,13 +169,18 @@ def examples_prediction(vectorized_concepts, positives, mmaxlen, cmaxlen):
             segmentation = pad_sequences(np.array(segmentation),padding='post',maxlen=mmaxlen+cmaxlen+3)
 
             distances = [0] # dummy
-            data = {
-                'Input-Token': instances,
-                'Input-Segment': segmentation,
-                'prediction_layer': np.asarray(distances),
-            }
 
-            yield data, data
+            for batch in range(math.ceil(len(instances)/batch_size)):
+                frag_instances = instances[batch*batch_size:(batch+1)*batch_size]
+                frag_segmentation = segmentation[batch*batch_size:(batch+1)*batch_size]
+
+                data = {
+                    'Input-Token': frag_instances,
+                    'Input-Segment': frag_segmentation,
+                    'prediction_layer': np.asarray(distances),
+                }
+
+                yield data, data
 
 
 from datetime import datetime
@@ -185,12 +190,14 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
     '''
     Ranking accuracy callback with early stopping.
     '''
-    def __init__(self, conf, original_model,val_generator,val_data):
+    def __init__(self, conf, original_model, concept, val_generator, val_data, prediction_steps):
         super().__init__()
         self.conf = conf
         self.original_model = original_model
+        self.concept = concept
         self.val_generator = val_generator
         self.val_data = val_data
+        self.prediction_steps = prediction_steps
 
         self.best = 0 # best accuracy
         self.wait = 0
@@ -215,7 +222,7 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
 
     def on_epoch_end(self, epoch, logs={}):
         self.losses.append(logs.get('loss'))
-        predictions = self.original_model.predict_generator(self.val_generator,steps=len(self.val_data.y))
+        predictions = self.original_model.predict_generator(self.val_generator,steps=self.prediction_steps)
         evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y)
         self.accuracy.append(evaluation_parameter)
 
@@ -227,7 +234,7 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
         if evaluation_parameter > self.best:
             logging.info('Intermediate model saved.')
             self.best = evaluation_parameter
-            self.original_model.save(self.model_path)
+            self.original_model.save_weights(self.model_path)
             self.wait = 0
         else:
             self.wait += 1
@@ -244,9 +251,9 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
             self.original_model.load_weights(self.model_path)
             logger.info('Best model reloaded.')
         except OSError:
-            pass
-        predictions = self.original_model.predict_generator(self.val_generator,steps=len(self.val_data.y))
-        evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y,write=True)
+            logger.info('No saved model found.')
+        predictions = self.original_model.predict_generator(self.val_generator,steps=self.prediction_steps)
+        evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y,write=self.history,concept=self.concept)
         if not self.conf.getint('model','save'): # if don't want to save model, delete the cached model
             try:
                 os.remove(self.model_path)
@@ -302,22 +309,22 @@ if __name__ == "__main__":
     # FIXME: only using one concept name per mention
     positives_training, positives_dev, positives_dev_sampled = load_data('data/gitig_positive_indices.pickle')
     del positives_dev
-    positive_training = [(_, span.lower()) for _, span in positives_training]
+    positives_training = [(_, span.lower()) for _, span in positives_training]
     positives_dev_sampled = [(_, span.lower()) for _, span in positives_dev_sampled]
 
     # generators for training and validation instances
-train_examples = examples(concept,positives_training,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
-dev_examples = examples(concept,positives_dev_sampled,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
-concept.biobert = transform_concepts(concept, tokenizer, cmaxlen = config.getint('training','cmaxlen'))
-prediction_examples = examples_prediction(concept.biobert, positives_dev_sampled, config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+    train_examples = examples(concept,positives_training,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+    dev_examples = examples(concept,positives_dev_sampled,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
+    concept.biobert = transform_concepts(concept, tokenizer, cmaxlen = config.getint('training','cmaxlen'))
+    prediction_examples = examples_prediction(concept.biobert, positives_dev_sampled, config.getint('training','mmaxlen'),config.getint('training','cmaxlen'),config.getint('training','batch_size'))
 
     # steps for fit_generator
-    train_steps = len([0 for (chosen_idx, idces), m_span in positives_training if len(chosen_idx) ==1]) * (1 + config.getint('training','neg_count'))
-    dev_steps = len(corpus_dev.names)
+    train_steps = len([0 for (chosen_idx, idces), m_span in positives_training if len(chosen_idx) ==1])
+    dev_steps = len(smpl_dev_data.mentions)
     seq_len = config.getint('training','mmaxlen') + config.getint('training','cmaxlen') + 3
 
     model = build_model(config['bert']['checkpoint_file'],config['bert']['config_file'],seq_len,config.getfloat('model','lr'))
-eval_function = EarlyStoppingRankingAccuracyGenerator(config, model, prediction_examples, corpus_dev_sampled)
-hist = model.fit_generator(train_examples, steps_per_epoch=train_steps,validation_data=dev_examples, validation_steps=dev_steps, epochs=config.getint('training','epochs'), callbacks=[eval_function])
+    eval_function = EarlyStoppingRankingAccuracyGenerator(config, model, concept, prediction_examples, smpl_dev_data, math.ceil(len(concept.names)/config.getint('training','batch_size'))*len(smpl_dev_data.mentions))
+    hist = model.fit_generator(train_examples, steps_per_epoch=train_steps,validation_data=dev_examples, validation_steps=dev_steps, epochs=config.getint('training','epochs'), callbacks=[eval_function])
 
 
