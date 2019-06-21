@@ -34,20 +34,6 @@ from ncbi_normalization import load
 from ncbi_normalization.parse_MEDIC_dictionary import concept_obj
 from ncbi_normalization import vectorizer, sample, callback
 
-#configurations
-TIME = time.strftime('%Y%m%d-%H%M%S')
-dynamic_defaults = {'timestamp': TIME}
-config = cp.ConfigParser(defaults=dynamic_defaults,interpolation=cp.ExtendedInterpolation(),strict=False)
-try:
-    directory = os.path.join(os.path.abspath(os.path.dirname(__file__)))
-    config.read(os.path.join(directory, 'src/defaults.cfg'))
-except NameError:
-    directory = '/home/lhchan/nor-bert/src'
-    config.read(os.path.join(directory, 'defaults.cfg'))
-
-gpu_config = tf.ConfigProto()
-gpu_config.gpu_options.allow_growth = True
-set_session(tf.Session(config=gpu_config))
 
 #logging
 logger = logging.getLogger(__name__)
@@ -117,7 +103,7 @@ def transform(tokenizer,mention,concepts,mmaxlen,cmaxlen):
     Takes in one mention, 1 pos and n neg concepts
     '''
     mention = tokenizer.tokenize(mention)[:mmaxlen]
-    # NO LOWERCASE
+    # BUG!
     instances = [["[CLS]"] + mention + ["[SEP]"] + tokenizer.tokenize(concept)[:cmaxlen] + ["[SEP]"] for concept in concepts]
     segmentation = [[0]*(len(mention)+2)+[1]*(len(concept)+1) for concept in concepts]
     instances = np.asarray([np.asarray([tokenizer.vocab[token] for token in instance] + [0] * (mmaxlen + cmaxlen + 3 - len(instance)) ) for instance in instances])
@@ -297,6 +283,21 @@ def build_model(checkpoint_file,config_file,sequence_len,learning_rate):
 
 
 if __name__ == "__main__":
+
+    #configurations
+    TIME = time.strftime('%Y%m%d-%H%M%S')
+    dynamic_defaults = {'timestamp': TIME}
+    config = cp.ConfigParser(defaults=dynamic_defaults,interpolation=cp.ExtendedInterpolation(),strict=False)
+    try:
+        directory = os.path.join(os.path.abspath(os.path.dirname(__file__)))
+        config.read(os.path.join(directory, 'src/defaults.cfg'))
+    except NameError:
+        directory = '/home/lhchan/nor-bert/src'
+        config.read(os.path.join(directory, 'defaults.cfg'))
+
+    gpu_config = tf.ConfigProto()
+    gpu_config.gpu_options.allow_growth = True
+    set_session(tf.Session(config=gpu_config))
 
     # concepts
     concept, smpl_dev_data, dictionary, corpus_dev_sampled = load_concepts(config['terminology']['dict_file'])
