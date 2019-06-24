@@ -8,6 +8,7 @@ import logging
 import logging.config
 import configparser as cp
 from tqdm import tqdm
+from itertools import tee
 import tensorflow as tf
 import numpy as np
 import keras_metrics
@@ -103,8 +104,8 @@ def transform(tokenizer,mention,concepts,mmaxlen,cmaxlen):
     Takes in one mention, 1 pos and n neg concepts
     '''
     mention = tokenizer.tokenize(mention)[:mmaxlen]
-    # BUG!
-    instances = [["[CLS]"] + mention + ["[SEP]"] + tokenizer.tokenize(concept)[:cmaxlen] + ["[SEP]"] for concept in concepts]
+    concepts = [tokenizer.tokenize(concept)[:cmaxlen] for concept in concepts]
+    instances = [["[CLS]"] + mention + ["[SEP]"] + concept + ["[SEP]"] for concept in concepts]
     segmentation = [[0]*(len(mention)+2)+[1]*(len(concept)+1) for concept in concepts]
     instances = np.asarray([np.asarray([tokenizer.vocab[token] for token in instance] + [0] * (mmaxlen + cmaxlen + 3 - len(instance)) ) for instance in instances])
     segmentation = pad_sequences(np.array(segmentation),padding='post',maxlen=mmaxlen+cmaxlen+3)
@@ -144,6 +145,7 @@ def transform_concepts(concept, tokenizer, cmaxlen):
     return concept
 
 def examples_prediction(vectorized_concepts, positives, mmaxlen, cmaxlen, batch_size):
+    # FIXME dunno if the step numbers are calculated correctly
     while True:
         for (chosen_idx, idces), m_span in tqdm(positives, ascii=True, desc='Predicting'):
             # FIXME: one for loop takes forever
@@ -184,6 +186,7 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
         self.val_generator = val_generator
         self.val_data = val_data
         self.prediction_steps = prediction_steps
+        self.cached_generator = None
 
         self.best = 0 # best accuracy
         self.wait = 0
@@ -208,7 +211,8 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
 
     def on_epoch_end(self, epoch, logs={}):
         self.losses.append(logs.get('loss'))
-        predictions = self.original_model.predict_generator(self.val_generator,steps=self.prediction_steps)
+        self.val_generator, self.cached_generator = tee(self.val_generator)
+        predictions = self.original_model.predict_generator(self.cached_generator,steps=self.prediction_steps)
         evaluation_parameter = callback.evaluate(self.val_data.mentions, predictions, self.val_data.y)
         self.accuracy.append(evaluation_parameter)
 
@@ -227,7 +231,7 @@ class EarlyStoppingRankingAccuracyGenerator(Callback):
             if self.wait > int(self.conf['training']['patience']):
                 self.stopped_epoch = epoch
                 self.original_model.stop_training = True
-        logger.info('Testing: epoch: {0}, self.original_model.stop_training: {1}'.format(epoch,self.original_model.stop_training))
+        logger.info('Testing: epoch: {0}, self.original_model.stop_training: {1}'.format(epoch+1,self.original_model.stop_training))
         return
 
     def on_train_end(self, logs=None):
@@ -257,8 +261,8 @@ def build_model(checkpoint_file,config_file,sequence_len,learning_rate):
     #biobert_train = load_trained_model_from_checkpoint(config_file, checkpoint_file, training=True, seq_len=sequence_len)
 
     # Unfreeze bert layers.
-    for layer in biobert.layers[:]:
-        layer.trainable = True
+    # for layer in biobert.layers[:]:
+    #     layer.trainable = True
 
     logger.info(biobert.input)
     logger.info(biobert.layers[-1].output)
@@ -269,7 +273,8 @@ def build_model(checkpoint_file,config_file,sequence_len,learning_rate):
 
     flatten_layer = Flatten()(slice_layer)
 
-    prediction_layer = Dense(1, activation='sigmoid',name='prediction_layer')(flatten_layer)
+    hidden_layer = Dense(400, activation='relu',name='hidden_layer')(flatten_layer)
+    prediction_layer = Dense(1, activation='sigmoid',name='prediction_layer')(hidden_layer)
 
     model = Model(inputs=biobert.input, outputs=prediction_layer)
 
@@ -317,6 +322,7 @@ if __name__ == "__main__":
     train_examples = examples(concept,positives_training,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
     dev_examples = examples(concept,positives_dev_sampled,tokenizer,config.getint('training','neg_count'),config.getint('training','mmaxlen'),config.getint('training','cmaxlen'))
     concept.biobert = transform_concepts(concept, tokenizer, cmaxlen = config.getint('training','cmaxlen'))
+    # FIXME wrong predictions after second epoch
     prediction_examples = examples_prediction(concept.biobert, positives_dev_sampled, config.getint('training','mmaxlen'),config.getint('training','cmaxlen'),config.getint('training','batch_size'))
 
     # steps for fit_generator
